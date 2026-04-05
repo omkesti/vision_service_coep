@@ -100,6 +100,7 @@ async def analyze(req: AnalyzeRequest):
         "risk_score":      fusion.risk_score,
         "confidence":      fusion.confidence,
         "decision_source": fusion.decision_source,
+        "crowd_score":     fusion.crowd_score,
         "lat":             req.lat,
         "lng":             req.lng,
         "snapshot_url":    None,

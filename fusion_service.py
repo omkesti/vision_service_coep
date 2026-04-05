@@ -12,6 +12,10 @@ logger = logging.getLogger("fusion")
 VEHICLE_COLLISION_MIN_RISK  = float(os.getenv("VEHICLE_COLLISION_MIN_RISK",  "0.20"))
 SEMANTIC_MIN_RISK_SUPPORT   = float(os.getenv("SEMANTIC_MIN_RISK_SUPPORT",   "0.25"))
 UNKNOWN_ANOMALY_RISK_THRESH = float(os.getenv("UNKNOWN_ANOMALY_RISK_THRESH", "0.75"))
+CROWD_FUSION_THRESHOLD      = float(os.getenv("CROWD_FUSION_THRESHOLD",      "0.45"))
+
+# Labels where classifier wins over crowd_gathering
+CLASSIFIER_PRIORITY_OVER_CROWD = {"fighting", "assault", "vehicle_collision", "fire", "shooting"}
 
 
 @dataclass
@@ -20,11 +24,18 @@ class FusionResult:
     risk_score: float
     confidence: float
     decision_source: str
+    crowd_score: float = 0.0
     risk_model_output: dict = field(default_factory=dict)
     classifier_output: dict = field(default_factory=dict)
 
 
-def fuse(risk_result, cls_result, degraded: str = None) -> FusionResult:
+def fuse(risk_result, cls_result, crowd_result=None, degraded: str = None) -> FusionResult:
+    result = _fuse_inner(risk_result, cls_result, crowd_result, degraded)
+    result.crowd_score = round(crowd_result.crowd_score, 4) if crowd_result else 0.0
+    return result
+
+
+def _fuse_inner(risk_result, cls_result, crowd_result=None, degraded: str = None) -> FusionResult:
 
     risk_out = {
         "autoencoder_score_raw":        risk_result.autoencoder_score_raw        if risk_result else None,
@@ -98,6 +109,17 @@ def fuse(risk_result, cls_result, degraded: str = None) -> FusionResult:
         # high calibrated risk but classifier couldn't identify type
         logger.info("Fusion: unknown_anomaly | risk_override ae_cal=%.3f", ae_cal)
         return FusionResult("unknown_anomaly", ae_cal, ae_cal, "risk_override", risk_out, cls_out)
+
+    # ── Crowd gathering check (before falling to normal) ─────────────────────
+    if crowd_result and crowd_result.crowd_detected and \
+       crowd_result.crowd_score >= CROWD_FUSION_THRESHOLD:
+        # Only use crowd label if classifier didn't already win with a priority label
+        if not (accepted and cls_label in CLASSIFIER_PRIORITY_OVER_CROWD):
+            fused_risk = round(0.5 * crowd_result.crowd_score + 0.5 * ae_cal, 4)
+            logger.info("Fusion: crowd_gathering | crowd_score=%.3f ae_cal=%.3f",
+                        crowd_result.crowd_score, ae_cal)
+            return FusionResult("crowd_gathering", fused_risk, crowd_result.crowd_score,
+                                "crowd_override", risk_out, cls_out)
 
     # both weak -> normal
     fused_risk = round(ae_cal * 0.3 + cls_conf * 0.1, 4)

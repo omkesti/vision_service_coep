@@ -22,6 +22,7 @@ import numpy as np
 
 from risk_scoring_service import RiskScoringService
 from incident_classification_service import IncidentClassificationService
+from crowd_detection_service import CrowdDetectionService
 from fusion_service import fuse, FusionResult
 
 logger = logging.getLogger("analysis_service")
@@ -30,6 +31,7 @@ logger = logging.getLogger("analysis_service")
 MAX_CONCURRENT_DOWNLOADS  = int(os.getenv("MAX_CONCURRENT_DOWNLOADS",  "5"))
 MAX_CONCURRENT_RISK       = int(os.getenv("MAX_CONCURRENT_RISK",        "2"))
 MAX_CONCURRENT_CLASSIFIER = int(os.getenv("MAX_CONCURRENT_CLASSIFIER",  "2"))
+MAX_CONCURRENT_CROWD      = int(os.getenv("MAX_CONCURRENT_CROWD",       "2"))
 DOWNLOAD_TIMEOUT_SECONDS  = int(os.getenv("DOWNLOAD_TIMEOUT_SECONDS",  "30"))
 REQUEST_TIMEOUT_SECONDS   = int(os.getenv("REQUEST_TIMEOUT_SECONDS",   "120"))
 ALERT_THRESHOLD           = float(os.getenv("ALERT_THRESHOLD",          "0.08"))
@@ -93,9 +95,13 @@ class AnalysisService:
         logger.info("Initializing IncidentClassificationService...")
         self.cls_svc = IncidentClassificationService()
 
+        logger.info("Initializing CrowdDetectionService...")
+        self.crowd_svc = CrowdDetectionService()
+
         self._download_sem  = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
         self._risk_sem      = asyncio.Semaphore(MAX_CONCURRENT_RISK)
         self._cls_sem       = asyncio.Semaphore(MAX_CONCURRENT_CLASSIFIER)
+        self._crowd_sem     = asyncio.Semaphore(MAX_CONCURRENT_CROWD)
         self._thread_pool   = ThreadPoolExecutor(max_workers=4, thread_name_prefix="vision")
 
         logger.info("AnalysisService ready | alert_threshold=%.2f", ALERT_THRESHOLD)
@@ -141,6 +147,9 @@ class AnalysisService:
     def _run_cls(self, cls_frames):
         return self.cls_svc.analyze(cls_frames)
 
+    def _run_crowd(self, score_frames):
+        return self.crowd_svc.analyze(score_frames)
+
     # ── Public entry point ────────────────────────────────────────────────────
     async def analyze(self, session_id: str, camera_id: str, stream_url: str) -> FusionResult:
         timings = {}
@@ -161,9 +170,10 @@ class AnalysisService:
             logger.info("[%s] frames: cal=%d score=%d cls=%d",
                         session_id, len(cal_frames), len(score_frames), len(cls_frames))
 
-            # Step 3 — run both branches in parallel
+            # Step 3 — run all three branches in parallel
             timings["t_branches"] = time.monotonic()
-            risk_result = cls_result = risk_error = cls_error = None
+            risk_result = cls_result = crowd_result = None
+            risk_error  = cls_error  = crowd_error  = None
 
             async def run_risk():
                 nonlocal risk_result, risk_error
@@ -187,15 +197,26 @@ class AnalysisService:
                         cls_error = e
                         logger.error("[%s] classifier branch failed: %s", session_id, e)
 
-            await asyncio.gather(run_risk(), run_cls())
+            async def run_crowd():
+                nonlocal crowd_result, crowd_error
+                async with self._crowd_sem:
+                    try:
+                        crowd_result = await loop.run_in_executor(
+                            self._thread_pool, self._run_crowd, score_frames
+                        )
+                    except Exception as e:
+                        crowd_error = e
+                        logger.error("[%s] crowd branch failed: %s", session_id, e)
+
+            await asyncio.gather(run_risk(), run_cls(), run_crowd())
             timings["branches_s"] = round(time.monotonic() - timings["t_branches"], 3)
 
-            if risk_error and cls_error:
-                raise RuntimeError(f"Both branches failed: risk={risk_error} cls={cls_error}")
+            if risk_error and cls_error and crowd_error:
+                raise RuntimeError(f"All branches failed: {risk_error} / {cls_error} / {crowd_error}")
 
             # Step 4 — fuse
             degraded = "risk_failed" if risk_error else ("cls_failed" if cls_error else None)
-            fusion = fuse(risk_result, cls_result, degraded=degraded)
+            fusion = fuse(risk_result, cls_result, crowd_result=crowd_result, degraded=degraded)
 
             logger.info(
                 "[%s] %s | incident=%s risk=%.4f conf=%.4f source=%s | "

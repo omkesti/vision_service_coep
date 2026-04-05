@@ -11,11 +11,12 @@ from pathlib import Path
 
 from risk_scoring_service import RiskScoringService
 from incident_classification_service import IncidentClassificationService
+from crowd_detection_service import CrowdDetectionService
 from fusion_service import fuse
 
 ROOT       = Path(__file__).resolve().parent
 MODEL_PATH = ROOT / "anomaly_engine" / "trained_model.pth"
-VIDEO_PATH = ROOT / "test_videos" / "test11.mp4"
+VIDEO_PATH = ROOT / "test_videos" / "crowd.mp4"
 
 ALERT_THRESHOLD    = 0.08
 CALIBRATION_FRAMES = 30
@@ -75,12 +76,16 @@ def main():
     print("Loading VideoMAE classifier...")
     cls_svc = IncidentClassificationService()
 
+    print("Loading YOLO crowd detector...")
+    crowd_svc = CrowdDetectionService()
+
     print(f"\nPreparing frames from: {VIDEO_PATH.name}")
     cal_frames, score_frames, cls_frames, all_frames = prepare_frames(str(VIDEO_PATH))
     print(f"  cal={len(cal_frames)} score={len(score_frames)} cls={len(cls_frames)} total={len(all_frames)}")
 
-    # ── Run both branches in parallel ─────────────────────────────────────────
-    risk_result = cls_result = risk_error = cls_error = None
+    # ── Run all three branches in parallel ────────────────────────────────────
+    risk_result = cls_result = crowd_result = None
+    risk_error  = cls_error  = crowd_error  = None
 
     def run_risk():
         nonlocal risk_result, risk_error
@@ -96,10 +101,18 @@ def main():
         except Exception as e:
             cls_error = e
 
+    def run_crowd():
+        nonlocal crowd_result, crowd_error
+        try:
+            crowd_result = crowd_svc.analyze(score_frames)
+        except Exception as e:
+            crowd_error = e
+
     t1 = threading.Thread(target=run_risk)
     t2 = threading.Thread(target=run_cls)
-    t1.start(); t2.start()
-    t1.join();  t2.join()
+    t3 = threading.Thread(target=run_crowd)
+    t1.start(); t2.start(); t3.start()
+    t1.join();  t2.join();  t3.join()
 
     # ── Print branch results ──────────────────────────────────────────────────
     print("\n── Branch A: Risk Scoring ──────────────────")
@@ -129,13 +142,25 @@ def main():
     else:
         print(f"  FAILED: {cls_error}")
 
+    print("\n── Branch C: YOLO Crowd Detection ──────────")
+    if crowd_result:
+        print(f"  crowd_detected        : {crowd_result.crowd_detected}")
+        print(f"  crowd_score           : {crowd_result.crowd_score}")
+        print(f"  max_person_count      : {crowd_result.max_person_count}")
+        print(f"  avg_person_count      : {crowd_result.avg_person_count}")
+        print(f"  cluster_frames_ratio  : {crowd_result.cluster_frames_ratio}")
+        print(f"  crowd_confidence      : {crowd_result.crowd_confidence}")
+        print(f"  time                  : {crowd_result.timing_s}s")
+    else:
+        print(f"  FAILED: {crowd_error}")
+
     # ── Fusion ────────────────────────────────────────────────────────────────
-    if risk_error and cls_error:
-        print("\nBoth branches failed.")
+    if risk_error and cls_error and crowd_error:
+        print("\nAll branches failed.")
         return
 
     degraded = "risk_failed" if risk_error else ("cls_failed" if cls_error else None)
-    fusion = fuse(risk_result, cls_result, degraded=degraded)
+    fusion = fuse(risk_result, cls_result, crowd_result=crowd_result, degraded=degraded)
 
     print("\n── Fusion Result ───────────────────────────")
     print(f"  incident_type   : {fusion.incident_type}")
@@ -168,6 +193,11 @@ def main():
                     (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 165, 255), 2)
         cv2.putText(frame, f"{fusion.decision_source} | conf:{fusion.confidence:.2f}",
                     (20, 115), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 0), 2)
+        if crowd_result:
+            crowd_txt = f"Crowd: {'YES' if crowd_result.crowd_detected else 'NO'} " \
+                        f"({crowd_result.max_person_count}p, score:{crowd_result.crowd_score:.2f})"
+            cv2.putText(frame, crowd_txt, (20, 145),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 100, 0), 2)
 
         cv2.imshow("Parallel Pipeline", frame)
         if cv2.waitKey(30) & 0xFF == ord("q"):
